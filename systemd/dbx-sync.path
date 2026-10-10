@@ -1,0 +1,10 @@
+[Unit]
+Description=Следить за установкой пакетов в контейнерах Distrobox (apt)
+
+[Path]
+# Этот файл «трогает» хук apt внутри контейнеров после каждой установки/удаления
+PathChanged=%h/.local/state/dbx-tools/trigger
+Unit=dbx-sync.service
+
+[Install]
+WantedBy=default.target

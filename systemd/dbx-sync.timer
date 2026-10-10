@@ -1,0 +1,10 @@
+[Unit]
+Description=Периодическая синхронизация ярлыков Distrobox (для dnf/zypper и ручных изменений)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=dbx-sync.service
+
+[Install]
+WantedBy=timers.target

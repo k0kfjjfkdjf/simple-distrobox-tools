@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# dbx-pm — пакетные менеджеры других дистрибутивов прямо в терминале хоста.
+# Ставится ссылками в ~/.local/bin:
+#   apt, apt-get  → выполняются в контейнере ubuntu  (DEB_BOX)
+#   dnf           → выполняется в контейнере fedora  (RPM_BOX)
+#
+# Примеры (без sudo — он добавляется внутри контейнера автоматически):
+#   apt update && apt upgrade
+#   apt install vlc
+#   apt install ./программа.deb
+#   dnf install ./программа.rpm
+#   DBX_BOX=debian apt install htop     # в другой контейнер разово
+set -uo pipefail
+ME="$(basename "$0")"
+
+# Внутри контейнера ~/.local/bin тоже в PATH — там отдаём управление настоящей программе,
+# иначе apt вызывал бы сам себя бесконечно.
+if [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; then
+  for d in /usr/bin /bin /usr/sbin /sbin; do
+    [ -x "$d/$ME" ] && exec "$d/$ME" "$@"
+  done
+  echo "$ME: в контейнере «${CONTAINER_ID:-?}» такой команды нет" >&2
+  exit 127
+fi
+
+DEB_BOX=ubuntu;  DEB_IMAGE=ubuntu:24.04
+RPM_BOX=fedora;  RPM_IMAGE=fedora:latest
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+case "$ME" in
+  apt|apt-get) BOX="${DBX_BOX:-$DEB_BOX}"; IMAGE="$DEB_IMAGE" ;;
+  dnf)         BOX="${DBX_BOX:-$RPM_BOX}"; IMAGE="$RPM_IMAGE" ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+command -v distrobox >/dev/null || { echo "$ME: нужен distrobox: sudo pacman -S distrobox podman" >&2; exit 1; }
+
+# Контейнера нет — создать (один раз)
+if ! distrobox list --no-color 2>/dev/null | awk -F'|' 'NR>1 {gsub(/^ +| +$/, "", $2); print $2}' | grep -qx -- "$BOX"; then
+  if [ -n "${DBX_BOX:-}" ]; then   # своё имя — образ угадывать не будем
+    echo "$ME: контейнера «$BOX» нет. Создайте его, например:" >&2
+    echo "  distrobox create -n $BOX -i debian:stable --hostname $BOX" >&2
+    exit 1
+  fi
+  echo "==> Контейнера «$BOX» нет, создаю из $IMAGE (первый раз — несколько минут)" >&2
+  distrobox create --yes -n "$BOX" -i "$IMAGE" --hostname "$BOX" || exit 1
+fi
+
+# Рабочий каталог сохраняется, поэтому относительные пути (./file.deb) внутри $HOME работают.
+distrobox enter -n "$BOX" -- sudo "$ME" "$@"
+rc=$?
+
+# Для apt ярлыки обновит хук dpkg; для dnf хука нет — синхронизируем сами.
+if [ "$ME" = dnf ]; then
+  "$(command -v dbx-sync || echo "$HOME/.local/bin/dbx-sync")" -q "$BOX" || true
+fi
+exit $rc

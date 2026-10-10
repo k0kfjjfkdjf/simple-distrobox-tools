@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# dbx-install — ставит пакеты других дистрибутивов в контейнеры Distrobox
+# и сразу выносит их ярлыки в меню хоста (через dbx-sync).
+#
+# Использование:
+#   dbx-install файл.deb            → в контейнер для .deb (по умолчанию ubuntu)
+#   dbx-install файл.rpm            → в контейнер для .rpm (по умолчанию fedora)
+#   dbx-install vlc gimp            → пакеты по имени из репозитория (ubuntu)
+#   dbx-install -c fedora vlc       → по имени, но в указанный контейнер
+#   dbx-install -r vlc              → удалить пакет (ярлык тоже исчезнет)
+#
+# Параметры:
+#   -c ИМЯ    контейнер (создаётся автоматически, если его нет)
+#   -i ОБРАЗ  образ для нового контейнера (например debian:13, opensuse/tumbleweed)
+#   -y        не спрашивать подтверждения у пакетного менеджера
+#   -r        удалить пакеты вместо установки
+#
+# Настройки по умолчанию можно переопределить в ~/.config/dbx-tools/config:
+#   DEB_BOX=ubuntu  DEB_IMAGE=ubuntu:24.04  RPM_BOX=fedora  RPM_IMAGE=fedora:latest
+set -euo pipefail
+
+DEB_BOX=ubuntu;  DEB_IMAGE=ubuntu:24.04
+RPM_BOX=fedora;  RPM_IMAGE=fedora:latest
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+SYNC="$(command -v dbx-sync || echo "$(dirname "$(readlink -f "$0")")/dbx-sync")"
+
+die() { printf 'dbx-install: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+BOX=""; IMAGE=""; YES=0; REMOVE=0
+while getopts "c:i:yrh" opt; do
+  case "$opt" in
+    c) BOX="$OPTARG" ;;
+    i) IMAGE="$OPTARG" ;;
+    y) YES=1 ;;
+    r) REMOVE=1 ;;
+    h) usage 0 ;;
+    *) usage 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || usage 2
+if [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; then
+  die "вы сейчас ВНУТРИ контейнера «${CONTAINER_ID:-?}». Выйдите командой exit и запустите снова на хосте."
+fi
+command -v distrobox >/dev/null || die "distrobox не установлен: sudo pacman -S distrobox podman"
+
+# Что ставим: .deb-файлы, .rpm-файлы или имена пакетов
+KIND=name; ARGS=()
+for a in "$@"; do
+  case "$a" in
+    *.deb|*.rpm)
+      [ "$REMOVE" = 1 ] && die "для удаления укажите имя пакета, а не файл"
+      k="${a##*.}"
+      [ "$KIND" = name ] || [ "$KIND" = "$k" ] || die "нельзя смешивать .deb и .rpm в одной команде"
+      KIND="$k"
+      [ -f "$a" ] || die "файл не найден: $a"
+      p="$(readlink -f "$a")"
+      # Домашний каталог виден в контейнере по тому же пути, остальное — через /run/host
+      case "$p" in "$HOME"/*) ;; *) p="/run/host$p" ;; esac
+      ARGS+=("$p") ;;
+    *) [ "$KIND" = name ] || die "нельзя смешивать файлы и имена пакетов"
+       ARGS+=("$a") ;;
+  esac
+done
+
+# Выбор контейнера и образа
+case "$KIND" in
+  deb) BOX="${BOX:-$DEB_BOX}"; IMAGE="${IMAGE:-$DEB_IMAGE}" ;;
+  rpm) BOX="${BOX:-$RPM_BOX}"; IMAGE="${IMAGE:-$RPM_IMAGE}" ;;
+  name)
+    BOX="${BOX:-$DEB_BOX}"
+    if [ -z "$IMAGE" ]; then
+      if [ "$BOX" = "$RPM_BOX" ]; then IMAGE="$RPM_IMAGE"; else IMAGE="$DEB_IMAGE"; fi
+    fi ;;
+esac
+
+# Создать контейнер, если его ещё нет
+if ! distrobox list --no-color 2>/dev/null | awk -F'|' 'NR>1 {gsub(/^ +| +$/, "", $2); print $2}' | grep -qx -- "$BOX"; then
+  [ "$REMOVE" = 1 ] && die "контейнера «$BOX» нет — удалять нечего"
+  echo "==> Создаю контейнер «$BOX» из образа $IMAGE (первый раз это займёт несколько минут)"
+  distrobox create --yes -n "$BOX" -i "$IMAGE" --hostname "$BOX"
+fi
+
+# Какой пакетный менеджер внутри
+PM="$(distrobox enter -n "$BOX" -- sh -c \
+  'for p in apt-get dnf zypper; do command -v $p >/dev/null 2>&1 && { echo $p; exit; }; done' \
+  </dev/null | tr -d '\r' | tail -n 1)"
+[ -n "$PM" ] || die "в контейнере «$BOX» не найден apt-get, dnf или zypper"
+case "$KIND:$PM" in
+  deb:apt-get|rpm:dnf|rpm:zypper|name:*) ;;
+  *) die ".$KIND нельзя поставить через $PM (контейнер «$BOX»). Укажите другой через -c" ;;
+esac
+
+# Команда для пакетного менеджера
+OP=$([ "$REMOVE" = 1 ] && echo remove || echo install)
+YF=""
+case "$PM" in
+  apt-get)
+    [ "$YES" = 1 ] && YF="-y"
+    if [ "$REMOVE" = 1 ]; then CMD="sudo apt-get remove $YF \"\$@\""
+    else CMD="sudo apt-get update && sudo apt-get install $YF \"\$@\""; fi ;;
+  dnf)
+    [ "$YES" = 1 ] && YF="-y"
+    CMD="sudo dnf $OP $YF \"\$@\"" ;;
+  zypper)
+    [ "$YES" = 1 ] && YF="--non-interactive"
+    CMD="sudo zypper $YF $OP \"\$@\"" ;;
+esac
+
+ACTION=$([ "$REMOVE" = 1 ] && echo "Удаляю" || echo "Устанавливаю")
+echo "==> $ACTION в «$BOX» ($PM): ${ARGS[*]}"
+distrobox enter -n "$BOX" -- bash -c "$CMD" bash "${ARGS[@]}"
+
+echo "==> Обновляю ярлыки в меню"
+"$SYNC" "$BOX" || echo "dbx-sync завершился с ошибкой (пакет при этом установлен)" >&2

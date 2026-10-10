@@ -1,0 +1,6 @@
+[Unit]
+Description=Синхронизация ярлыков приложений из контейнеров Distrobox
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/dbx-sync -q

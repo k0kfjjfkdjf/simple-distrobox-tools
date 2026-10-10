@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# dbx-sync — синхронизирует ярлыки приложений (.desktop) из контейнеров
+# Distrobox в меню хоста (KDE Plasma, GNOME и др.).
+#
+# Новые приложения в контейнере → экспортируются через distrobox-export.
+# Удалённые из контейнера приложения → их ярлыки убираются с хоста.
+#
+# Использование:
+#   dbx-sync              синхронизировать все ЗАПУЩЕННЫЕ контейнеры
+#   dbx-sync ubuntu       синхронизировать указанный контейнер (запустит его)
+#   dbx-sync --all        все контейнеры, включая остановленные (запустит их)
+#   dbx-sync -n           только показать, что будет сделано
+#   dbx-sync -q           без вывода (для systemd)
+set -uo pipefail
+
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dbx-tools"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools"
+IGNORE_FILE="$CONF_DIR/ignore"
+TRIGGER="$STATE_DIR/trigger"
+
+if [ -n "${DBX_CONTAINER_MANAGER:-}" ]; then MGR="$DBX_CONTAINER_MANAGER"
+elif command -v podman >/dev/null; then MGR=podman
+else MGR=docker; fi
+
+QUIET=0; DRY=0; ALL=0; NAMES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quiet) QUIET=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -a|--all) ALL=1 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "Неизвестный параметр: $1" >&2; exit 2 ;;
+    *) NAMES+=("$1") ;;
+  esac
+  shift
+done
+
+log() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }   # ошибки видны всегда, в т.ч. в journalctl
+run() { if [ "$DRY" = 1 ]; then log "  [dry-run] $*"; else "$@"; fi; }
+
+mkdir -p "$STATE_DIR" "$APPS_DIR" "$CONF_DIR"
+[ -f "$IGNORE_FILE" ] || cat > "$IGNORE_FILE" <<'IGN'
+# Ярлыки, которые dbx-sync не будет выносить в меню.
+# Формат: шаблон "контейнер/имя.desktop", допускаются * и ?
+# Примеры:
+#   ubuntu/org.gnome.*
+#   */debian-uxterm.desktop
+IGN
+
+# Один экземпляр за раз (dbx-install и systemd могут вызвать одновременно).
+exec 9>"$STATE_DIR/.lock"
+flock 9
+
+# Скрипт, который выполняется ВНУТРИ контейнера: печатает пути .desktop-файлов,
+# которые должны быть видны в меню (Type=Application, не NoDisplay/Hidden,
+# и это не уже экспортированный из другого контейнера ярлык).
+read -r -d '' SCAN <<'SH'
+for d in /usr/share/applications /usr/local/share/applications; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*.desktop; do
+    [ -f "$f" ] || continue
+    awk '
+      /^\[/ { sec = $0; sub(/\r$/, "", sec); next }
+      sec == "[Desktop Entry]" {
+        sub(/\r$/, "")
+        if ($0 ~ /^Type=/) { if ($0 == "Type=Application") app = 1; else bad = 1 }
+        if ($0 ~ /^(NoDisplay|Hidden)=true/) bad = 1
+        if ($0 ~ /^Exec=.*distrobox/) bad = 1
+      }
+      END { exit !(app && !bad) }' "$f" && printf "%s\n" "$f"
+  done
+done
+SH
+
+ignored() {  # $1 = "контейнер/имя.desktop"
+  local pat
+  while IFS= read -r pat; do
+    pat="${pat%%#*}"; pat="${pat//[[:space:]]/}"
+    [ -z "$pat" ] && continue
+    # shellcheck disable=SC2053
+    [[ "$1" == $pat ]] && return 0
+  done < "$IGNORE_FILE"
+  return 1
+}
+
+remove_shortcut() {  # $1 = контейнер, $2 = имя.desktop
+  local f="$APPS_DIR/$1-$2"
+  if [ -f "$f" ] && grep -q 'distrobox' "$f"; then
+    log "  − $2"
+    run rm -f "$f"
+  fi
+}
+
+# Для контейнеров на apt: хук, который после каждой операции dpkg «дёргает»
+# файл-триггер на хосте. systemd (dbx-sync.path) видит это и запускает синхронизацию.
+ensure_apt_hook() {  # $1 = контейнер
+  local hook="DPkg::Post-Invoke { \"touch '$TRIGGER' 2>/dev/null || true\"; };"
+  "$MGR" exec -u root "$1" sh -c '
+    command -v apt-get >/dev/null 2>&1 || exit 0
+    f=/etc/apt/apt.conf.d/99dbx-sync
+    [ -f "$f" ] && [ "$(cat "$f")" = "$1" ] && exit 0
+    printf "%s\n" "$1" > "$f"' sh "$hook" >/dev/null 2>&1 || true
+}
+
+CHANGED=0
+
+sync_box() {  # $1 = контейнер
+  local c="$1" state="$STATE_DIR/$1.list" found f base key
+  local -A now=() old=()
+
+  if ! found="$("$MGR" exec "$c" sh -c "$SCAN" 2>/dev/null)"; then
+    err "! $c: не удалось прочитать список приложений, пропускаю"
+    return
+  fi
+  log "• $c"
+  [ "$DRY" = 1 ] || ensure_apt_hook "$c"
+
+  if [ -f "$state" ]; then
+    while IFS= read -r base; do [ -n "$base" ] && old["$base"]=1; done < "$state"
+  fi
+
+  # Новые приложения → экспорт
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    base="$(basename "$f")"; key="$c/$base"
+    ignored "$key" && continue
+    now["$base"]=1
+    if [ ! -f "$APPS_DIR/$c-$base" ]; then
+      log "  + $base"
+      if [ "$DRY" = 1 ]; then log "  [dry-run] distrobox-export --app $f"
+      elif ! out="$(distrobox enter -n "$c" -- distrobox-export --app "$f" </dev/null 2>&1)"; then
+        err "! $c: не удалось экспортировать $base: ${out//$'\n'/ | }"
+        unset 'now[$base]'; continue
+      fi
+      CHANGED=1
+    fi
+  done <<< "$found"
+
+  # Пропавшие из контейнера приложения → убрать ярлык
+  for base in "${!old[@]}"; do
+    if [ -z "${now[$base]:-}" ]; then remove_shortcut "$c" "$base"; CHANGED=1; fi
+  done
+
+  if [ "$DRY" = 0 ]; then
+    if [ ${#now[@]} -gt 0 ]; then printf '%s\n' "${!now[@]}" | sort > "$state"
+    else rm -f "$state"; fi
+  fi
+}
+
+# Какие контейнеры обрабатывать
+mapfile -t EXISTING < <("$MGR" ps -a --filter label=manager=distrobox --format '{{.Names}}' 2>/dev/null)
+if [ ${#NAMES[@]} -gt 0 ]; then
+  TARGETS=("${NAMES[@]}")
+elif [ "$ALL" = 1 ]; then
+  TARGETS=("${EXISTING[@]}")
+else
+  # Остановленный контейнер измениться не мог — не будим его зря.
+  mapfile -t TARGETS < <("$MGR" ps --filter label=manager=distrobox --format '{{.Names}}' 2>/dev/null)
+fi
+
+for c in "${TARGETS[@]}"; do
+  [ -z "$c" ] && continue
+  if ! printf '%s\n' "${EXISTING[@]}" | grep -qx -- "$c"; then
+    err "! контейнера «$c» нет"; continue
+  fi
+  # Явно указанный остановленный контейнер — запустить.
+  if [ "$("$MGR" inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" != "true" ]; then
+    run distrobox enter -n "$c" -- true >/dev/null 2>&1
+  fi
+  sync_box "$c"
+done
+
+# Контейнер удалён целиком (distrobox rm) — подчистить оставшиеся ярлыки.
+for state in "$STATE_DIR"/*.list; do
+  [ -f "$state" ] || continue
+  c="$(basename "$state" .list)"
+  printf '%s\n' "${EXISTING[@]}" | grep -qx -- "$c" && continue
+  log "• $c (контейнер удалён)"
+  while IFS= read -r base; do [ -n "$base" ] && remove_shortcut "$c" "$base"; done < "$state"
+  run rm -f "$state"; CHANGED=1
+done
+
+# Обновить меню
+if [ "$CHANGED" = 1 ] && [ "$DRY" = 0 ]; then
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" 2>/dev/null
+  command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1
+fi
+exit 0
