@@ -43,34 +43,43 @@ dbx-sync -n                      # показать, что изменится, 
 
 ## Установка
 
-```bash
-sudo pacman -S --needed distrobox podman     # или аналог в вашем дистрибутиве
-git clone https://github.com/k0kfjjfkdjf/simple-distrobox-tools.git
-cd simple-distrobox-tools
-./install.sh
-```
-
-Всё ставится в домашний каталог, без `sudo`: скрипты в `~/.local/bin`,
-службы в `~/.config/systemd/user`. `install.sh` сам добавит `~/.local/bin` в `PATH`
-и предложит подсветку приглашения внутри контейнера. После установки откройте новый терминал.
-
-### Steam Deck (SteamOS)
-
-`pacman` там не нужен (и не сработает — системный раздел только для чтения):
-в SteamOS 3.5+ `distrobox` и `podman` уже встроены. В режиме рабочего стола откройте Konsole:
+Одна команда для любой системы — Arch, Steam Deck, Fedora, Ubuntu и др.:
 
 ```bash
-git clone https://github.com/k0kfjjfkdjf/simple-distrobox-tools.git
-cd simple-distrobox-tools
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/k0kfjjfkdjf/simple-distrobox-tools/main/get.sh | bash
 ```
 
-Контейнеры, скрипты и настройки лежат в `/home` и переживают обновления SteamOS.
-Программы появляются в меню **режима рабочего стола**; чтобы запускать их из игрового
-режима, добавьте ярлык в Steam как стороннюю игру («Добавить стороннюю игру»).
+Установщик сам определит систему и при необходимости поставит `distrobox` и `podman`:
 
-Удаление: `./install.sh --remove`. Контейнеры и уже вынесенные ярлыки при этом
-не трогаются (контейнер удаляется как обычно — `distrobox rm имя`).
+| Система | Что делает |
+|---|---|
+| Arch и производные | `sudo pacman -S distrobox podman` (спросит пароль) |
+| SteamOS (Steam Deck) | ничего — всё встроено с SteamOS 3.5; если distrobox нет, кладёт его в `~/.local` |
+| Fedora / Debian / Ubuntu / openSUSE | `dnf` / `apt-get` / `zypper` |
+| Silverblue, Bazzite (rpm-ostree) | ничего — distrobox обычно встроен |
+
+Дальше всё ставится в домашний каталог, без `sudo`: файлы проекта в
+`~/.local/share/simple-distrobox-tools`, команды в `~/.local/bin`, службы в
+`~/.config/systemd/user`. `~/.local/bin` сам добавляется в `PATH`. Поэтому всё
+переживает обновления SteamOS и других систем с корнем только для чтения.
+После установки откройте новый терминал.
+
+**Обновление** — та же команда ещё раз.
+**Удаление** — `bash ~/.local/share/simple-distrobox-tools/install.sh --remove`
+(контейнеры и уже вынесенные ярлыки не трогаются; контейнер удаляется как обычно — `distrobox rm имя`).
+
+Вручную, без `curl | bash`:
+
+```bash
+git clone https://github.com/k0kfjjfkdjf/simple-distrobox-tools.git
+cd simple-distrobox-tools && ./install.sh
+```
+
+### Steam Deck
+
+Команду выше запускайте в Konsole в режиме рабочего стола. Программы появляются
+в меню **режима рабочего стола**; чтобы запускать их из игрового режима, добавьте
+ярлык в Steam как стороннюю игру («Добавить стороннюю игру»).
 
 ## Как это устроено
 
