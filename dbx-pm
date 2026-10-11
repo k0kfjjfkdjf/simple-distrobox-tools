@@ -68,8 +68,7 @@ fi
 distrobox enter -n "$BOX" -- sudo "$ME" "$@"
 rc=$?
 
-# Для apt ярлыки обновит хук dpkg; для dnf хука нет — синхронизируем сами.
-if [ "$ME" = dnf ]; then
-  "$(command -v dbx-sync || echo "$HOME/.local/bin/dbx-sync")" -q "$BOX" || true
-fi
+# Обновить ярлыки в меню. Для apt есть ещё хук dpkg, но в только что созданном
+# контейнере его пока нет (его кладёт dbx-sync) — поэтому синхронизируем всегда.
+"$(command -v dbx-sync || echo "$HOME/.local/bin/dbx-sync")" "$BOX" || true
 exit $rc
