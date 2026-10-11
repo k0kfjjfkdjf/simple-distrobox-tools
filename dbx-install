@@ -5,6 +5,7 @@
 # Использование:
 #   dbx-install файл.deb            → в контейнер для .deb (по умолчанию ubuntu)
 #   dbx-install файл.rpm            → в контейнер для .rpm (по умолчанию fedora)
+#   dbx-install файл.pkg.tar.zst    → в контейнер arch (пакет Arch Linux)
 #   dbx-install vlc gimp            → пакеты по имени из репозитория (ubuntu)
 #   dbx-install -c fedora vlc       → по имени, но в указанный контейнер
 #   dbx-install -r vlc              → удалить пакет (ярлык тоже исчезнет)
@@ -17,15 +18,10 @@
 #
 # Настройки по умолчанию можно переопределить в ~/.config/dbx-tools/config:
 #   DEB_BOX=ubuntu  DEB_IMAGE=ubuntu:24.04  RPM_BOX=fedora  RPM_IMAGE=fedora:latest
+#   ARCH_BOX=arch   ARCH_IMAGE=docker.io/library/archlinux:latest
 set -euo pipefail
-
-DEB_BOX=ubuntu;  DEB_IMAGE=ubuntu:24.04
-RPM_BOX=fedora;  RPM_IMAGE=fedora:latest
-CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools/config"
-# shellcheck disable=SC1090
-[ -f "$CONF" ] && . "$CONF"
-
-SYNC="$(command -v dbx-sync || echo "$(dirname "$(readlink -f "$0")")/dbx-sync")"
+# shellcheck source=dbx-lib
+. "$(dirname "$(readlink -f "$0")")/dbx-lib"
 
 die() { printf 'dbx-install: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -48,30 +44,15 @@ if [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; then
 fi
 command -v distrobox >/dev/null || die "distrobox не установлен (Arch: sudo pacman -S distrobox podman; SteamOS 3.5+: уже встроен; иначе см. README)"
 
-# --- совместимость со старыми Distrobox (SteamOS и др.) ---
-if [ -n "${DBX_CONTAINER_MANAGER:-}" ]; then MGR="$DBX_CONTAINER_MANAGER"
-elif command -v podman >/dev/null; then MGR=podman
-else MGR=docker; fi
-
-box_exists() { "$MGR" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx -- "$1"; }
-
-create_box() {  # $1 = имя, $2 = образ
-  local help args=(-n "$1" -i "$2")
-  help="$(distrobox create --help 2>&1)"
-  grep -q -- '--yes' <<<"$help" && args=(--yes "${args[@]}")
-  grep -q -- '--hostname' <<<"$help" && args+=(--hostname "$1")
-  distrobox create "${args[@]}"
-}
-
 
 # Что ставим: .deb-файлы, .rpm-файлы или имена пакетов
 KIND=name; ARGS=()
 for a in "$@"; do
   case "$a" in
-    *.deb|*.rpm)
+    *.deb|*.rpm|*.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz)
       [ "$REMOVE" = 1 ] && die "для удаления укажите имя пакета, а не файл"
-      k="${a##*.}"
-      [ "$KIND" = name ] || [ "$KIND" = "$k" ] || die "нельзя смешивать .deb и .rpm в одной команде"
+      case "$a" in *.deb) k=deb ;; *.rpm) k=rpm ;; *) k=pkg ;; esac
+      [ "$KIND" = name ] || [ "$KIND" = "$k" ] || die "нельзя смешивать пакеты разных форматов в одной команде"
       KIND="$k"
       [ -f "$a" ] || die "файл не найден: $a"
       p="$(readlink -f "$a")"
@@ -87,27 +68,26 @@ done
 case "$KIND" in
   deb) BOX="${BOX:-$DEB_BOX}"; IMAGE="${IMAGE:-$DEB_IMAGE}" ;;
   rpm) BOX="${BOX:-$RPM_BOX}"; IMAGE="${IMAGE:-$RPM_IMAGE}" ;;
+  pkg) BOX="${BOX:-$ARCH_BOX}"; IMAGE="${IMAGE:-$ARCH_IMAGE}" ;;
   name)
     BOX="${BOX:-$DEB_BOX}"
     if [ -z "$IMAGE" ]; then
-      if [ "$BOX" = "$RPM_BOX" ]; then IMAGE="$RPM_IMAGE"; else IMAGE="$DEB_IMAGE"; fi
+      case "$BOX" in
+        "$RPM_BOX") IMAGE="$RPM_IMAGE" ;; "$ARCH_BOX") IMAGE="$ARCH_IMAGE" ;; *) IMAGE="$DEB_IMAGE" ;;
+      esac
     fi ;;
 esac
 
 # Создать контейнер, если его ещё нет
 if ! box_exists "$BOX"; then
   [ "$REMOVE" = 1 ] && die "контейнера «$BOX» нет — удалять нечего"
-  echo "==> Создаю контейнер «$BOX» из образа $IMAGE (первый раз это займёт несколько минут)"
   create_box "$BOX" "$IMAGE"
 fi
 
 # Какой пакетный менеджер внутри
-PM="$(distrobox enter -n "$BOX" -- sh -c \
-  'for p in apt-get dnf zypper; do command -v $p >/dev/null 2>&1 && { echo $p; exit; }; done' \
-  </dev/null | tr -d '\r' | tail -n 1)"
-[ -n "$PM" ] || die "в контейнере «$BOX» не найден apt-get, dnf или zypper"
+PM="$(box_pm "$BOX")" || die "в контейнере «$BOX» не найден apt, dnf, pacman или zypper"
 case "$KIND:$PM" in
-  deb:apt-get|rpm:dnf|rpm:zypper|name:*) ;;
+  deb:apt|rpm:dnf|rpm:zypper|pkg:pacman|name:*) ;;
   *) die ".$KIND нельзя поставить через $PM (контейнер «$BOX»). Укажите другой через -c" ;;
 esac
 
@@ -115,7 +95,7 @@ esac
 OP=$([ "$REMOVE" = 1 ] && echo remove || echo install)
 YF=""
 case "$PM" in
-  apt-get)
+  apt)
     [ "$YES" = 1 ] && YF="-y"
     if [ "$REMOVE" = 1 ]; then CMD="sudo apt-get remove $YF \"\$@\""
     else CMD="sudo apt-get update && sudo apt-get install $YF \"\$@\""; fi ;;
@@ -125,6 +105,11 @@ case "$PM" in
   zypper)
     [ "$YES" = 1 ] && YF="--non-interactive"
     CMD="sudo zypper $YF $OP \"\$@\"" ;;
+  pacman)
+    [ "$YES" = 1 ] && YF="--noconfirm"
+    if [ "$REMOVE" = 1 ]; then CMD="sudo pacman -Rns $YF \"\$@\""
+    elif [ "$KIND" = pkg ]; then CMD="sudo pacman -U $YF \"\$@\""
+    else CMD="sudo pacman -Syu --needed $YF \"\$@\""; fi ;;
 esac
 
 ACTION=$([ "$REMOVE" = 1 ] && echo "Удаляю" || echo "Устанавливаю")
@@ -132,4 +117,4 @@ echo "==> $ACTION в «$BOX» ($PM): ${ARGS[*]}"
 distrobox enter -n "$BOX" -- bash -c "$CMD" bash "${ARGS[@]}"
 
 echo "==> Обновляю ярлыки в меню"
-"$SYNC" "$BOX" || echo "dbx-sync завершился с ошибкой (пакет при этом установлен)" >&2
+dbx_sync "$BOX"

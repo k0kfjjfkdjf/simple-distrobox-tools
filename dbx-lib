@@ -1,0 +1,94 @@
+# shellcheck shell=bash
+# dbx-lib — общий код для dbx, dbx-pm, dbx-install, install.sh.
+# Подключается через «. dbx-lib»; сам по себе не запускается.
+
+# --- настройки (можно переопределить в ~/.config/dbx-tools/config) ---
+DEB_BOX=ubuntu;  DEB_IMAGE=ubuntu:24.04
+RPM_BOX=fedora;  RPM_IMAGE=fedora:latest
+ARCH_BOX=arch;   ARCH_IMAGE=docker.io/library/archlinux:latest
+DBX_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools/config"
+# shellcheck disable=SC1090
+[ -f "$DBX_CONF" ] && . "$DBX_CONF"
+
+DBX_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/dbx-tools"
+DBX_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+if [ -n "${DBX_CONTAINER_MANAGER:-}" ]; then MGR="$DBX_CONTAINER_MANAGER"
+elif command -v podman >/dev/null; then MGR=podman
+else MGR=docker; fi
+
+in_container() { [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; }
+
+os_id() { ( . /etc/os-release 2>/dev/null; echo "${ID:-}" ); }
+
+# Живой ли pacman на хосте. На SteamOS он формально есть, но системный раздел
+# только для чтения и стирается обновлениями — считаем его недоступным.
+# Принудительно включить: DBX_HOST_PACMAN=1.
+host_pacman_ok() {
+  [ "${DBX_HOST_PACMAN:-}" = 1 ] && return 0
+  [ "${DBX_HOST_PACMAN:-}" = 0 ] && return 1
+  [ -x /usr/bin/pacman ] || return 1
+  [ "$(os_id)" = steamos ] && return 1
+  command -v rpm-ostree >/dev/null && return 1
+  findmnt -no OPTIONS /usr 2>/dev/null | grep -qE '(^|,)ro(,|$)' && return 1
+  return 0
+}
+
+# Настоящий (не наша ссылка) помощник AUR на хосте: yay или paru
+host_aur_helper() {
+  host_pacman_ok || return 1
+  local h p
+  for h in yay paru; do
+    for p in /usr/bin/$h /usr/local/bin/$h; do [ -x "$p" ] && { echo "$h"; return 0; }; done
+  done
+  return 1
+}
+
+# --- контейнеры ---
+list_boxes() { "$MGR" ps -a --filter label=manager=distrobox --format '{{.Names}}' 2>/dev/null; }
+box_exists() { "$MGR" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx -- "$1"; }
+box_running() { [ "$("$MGR" inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+box_start() { box_running "$1" || "$MGR" start "$1" >/dev/null 2>&1; }
+
+# Выполнить sh-скрипт в контейнере от root (быстрее distrobox enter; для запросов)
+box_sh() {  # $1 = контейнер, $2 = скрипт, дальше аргументы скрипта
+  local b="$1" s="$2"; shift 2
+  box_start "$b" && "$MGR" exec -u root "$b" sh -c "$s" sh "$@" </dev/null
+}
+
+create_box() {  # $1 = имя, $2 = образ. Без флагов, которых нет в старых distrobox.
+  local help args=(-n "$1" -i "$2")
+  help="$(distrobox create --help 2>&1)"
+  grep -q -- '--yes' <<<"$help" && args=(--yes "${args[@]}")
+  grep -q -- '--hostname' <<<"$help" && args+=(--hostname "$1")
+  echo "==> Создаю контейнер «$1» из $2 (первый раз — несколько минут)" >&2
+  distrobox create "${args[@]}"
+}
+
+ensure_box() {  # $1 = имя, $2 = образ
+  box_exists "$1" || create_box "$1" "$2"
+}
+
+# Пакетный менеджер внутри контейнера (с кэшем, чтобы не спрашивать каждый раз)
+box_pm() {
+  local b="$1" f="$DBX_STATE/pm.$1" pm=""
+  if [ -s "$f" ]; then cat "$f"; return; fi
+  pm="$(box_sh "$b" 'for p in apt-get dnf pacman zypper; do command -v $p >/dev/null 2>&1 && { echo $p; exit; }; done' 2>/dev/null | tr -d '\r' | tail -n1)"
+  pm="${pm/apt-get/apt}"
+  [ -n "$pm" ] || return 1
+  mkdir -p "$DBX_STATE"; echo "$pm" > "$f"; echo "$pm"
+}
+
+# yay внутри коробки arch: собрать из AUR при первом использовании
+ensure_yay_in_box() {  # $1 = контейнер
+  distrobox enter -n "$1" -- sh -c 'command -v yay >/dev/null 2>&1' </dev/null >/dev/null 2>&1 && return 0
+  echo "==> Ставлю yay в контейнер «$1» (один раз, пару минут)" >&2
+  distrobox enter -n "$1" -- bash -c '
+    set -e
+    sudo pacman -Syu --needed --noconfirm base-devel git
+    d="$(mktemp -d)"; trap "rm -rf \"$d\"" EXIT
+    git clone --depth 1 https://aur.archlinux.org/yay-bin.git "$d"
+    cd "$d" && makepkg -si --noconfirm'
+}
+
+dbx_sync() { "$DBX_BIN/dbx-sync" "$@" || true; }

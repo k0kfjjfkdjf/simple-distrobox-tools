@@ -18,10 +18,10 @@ OS_ID="$( . /etc/os-release 2>/dev/null; echo "${ID:-}" )"
 
 if [ "${1:-}" = "--remove" ]; then
   systemctl --user disable --now dbx-sync.path dbx-sync.timer 2>/dev/null || true
-  for l in apt apt-get dnf; do
+  for l in apt apt-get dnf pacman yay; do
     [ "$(readlink "$BIN/$l" 2>/dev/null)" = dbx-pm ] && rm -f "$BIN/$l"
   done
-  rm -f "$BIN/dbx-install" "$BIN/dbx-sync" "$BIN/dbx-pm" "$UNITS"/dbx-sync.{service,path,timer}
+  rm -f "$BIN"/{dbx,dbx-lib,dbx-install,dbx-sync,dbx-pm} "$UNITS"/dbx-sync.{service,path,timer}
   systemctl --user daemon-reload
   # убрать наши блоки из ~/.bashrc (между маркером и строкой «# end»)
   if [ -f "$BASHRC" ]; then
@@ -51,18 +51,31 @@ fi
 
 mkdir -p "$BIN" "$UNITS" "$STATE"
 touch "$STATE/trigger"
-install -m755 "$SRC/dbx-install" "$SRC/dbx-sync" "$SRC/dbx-pm" "$BIN/"
+install -m755 "$SRC"/{dbx,dbx-install,dbx-sync,dbx-pm} "$BIN/"
+install -m644 "$SRC/dbx-lib" "$BIN/"
+# shellcheck source=dbx-lib
+. "$BIN/dbx-lib"
 
 # apt / apt-get / dnf на хосте → в контейнеры (если в системе нет настоящих с тем же именем)
+link() {  # $1 = команда
+  if [ "$(readlink "$BIN/$1" 2>/dev/null)" = dbx-pm ] || [ ! -e "$BIN/$1" ]; then ln -sfn dbx-pm "$BIN/$1"; fi
+}
 for l in apt apt-get dnf; do
   real=""
   for d in /usr/bin /bin /usr/local/bin; do [ -x "$d/$l" ] && real="$d/$l"; done
   if [ -n "$real" ]; then
     echo "Пропускаю «$l»: в системе уже есть $real"
   else
-    ln -sfn dbx-pm "$BIN/$l"
+    link "$l"
   fi
 done
+# pacman / yay → в контейнер arch, только если pacman хоста недоступен (Steam Deck и т.п.)
+if host_pacman_ok; then
+  for l in pacman yay; do [ "$(readlink "$BIN/$l" 2>/dev/null)" = dbx-pm ] && rm -f "$BIN/$l"; done
+else
+  link pacman; link yay
+  echo "pacman и yay будут работать в контейнере «$ARCH_BOX» (pacman системы недоступен)."
+fi
 install -m644 "$SRC"/systemd/dbx-sync.{service,path,timer} "$UNITS/"
 
 systemctl --user daemon-reload
@@ -101,6 +114,8 @@ echo "Первая синхронизация:"
 
 echo
 echo "Готово. Откройте НОВЫЙ терминал (или выполните: source ~/.bashrc), затем:"
+echo "  dbx install vlc            (найдёт везде и спросит, откуда ставить)"
+echo "  dbx upgrade                (обновит систему и все контейнеры)"
 echo "  apt install vlc            (выполнится в контейнере ubuntu)"
 echo "  dnf install ./файл.rpm     (выполнится в контейнере fedora)"
 echo "  dbx-install ./файл.deb     (сам выберет контейнер по типу файла)"

@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# dbx — один пакетный менеджер поверх хоста и всех контейнеров Distrobox.
+#
+#   dbx install ИМЯ    найти пакет везде и спросить, откуда ставить
+#   dbx search  ИМЯ    поиск по всем источникам
+#   dbx remove  ИМЯ    найти, где установлен, и удалить
+#   dbx upgrade [-y]   обновить хост, flatpak и все контейнеры
+#   dbx sources        какие источники сейчас доступны
+#
+# Источники: pacman хоста (если он живой — на Steam Deck он пропускается),
+# AUR (yay/paru хоста или yay в контейнере arch), и каждый контейнер Distrobox
+# со своим apt / dnf / pacman / zypper. Если pacman хоста недоступен и контейнера
+# arch ещё нет, Arch и AUR ищутся через их сайты, а контейнер создаётся при установке.
+set -uo pipefail
+# shellcheck source=dbx-lib
+. "$(dirname "$(readlink -f "$0")")/dbx-lib"
+
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+die() { printf 'dbx: %s\n' "$*" >&2; exit 1; }
+B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; R=$'\033[0m'
+[ -t 1 ] || { B=; D=; G=; Y=; C=; R=; }
+TTY=/dev/tty; { : </dev/tty; } 2>/dev/null || TTY=/dev/stdin
+
+in_container && die "вы внутри контейнера «${CONTAINER_ID:-?}». Выйдите (exit) и запустите на хосте."
+
+# ---------- запросы к пакетным менеджерам (выполняются через sh -c) ----------
+# Вывод каждого: строки «имя<TAB>версия<TAB>установлен(0/1)<TAB>описание»
+
+read -r -d '' PAC_EXACT <<'SH'
+v=$(LC_ALL=C pacman -Si "$1" 2>/dev/null | awk -F' *: ' '$1=="Version"{print $2; exit}')
+[ -n "$v" ] || exit 0
+i=0; pacman -Q "$1" >/dev/null 2>&1 && i=1
+printf '%s\t%s\t%s\t\n' "$1" "$v" "$i"
+SH
+read -r -d '' PAC_SEARCH <<'SH'
+LC_ALL=C pacman -Ss "$1" 2>/dev/null | awk '
+  /^[^ ]/ { split($1, a, "/"); n = a[2]; v = $2; i = ($0 ~ /\[installed/) ? 1 : 0
+            getline d; sub(/^ +/, "", d); printf "%s\t%s\t%s\t%s\n", n, v, i, d }'
+SH
+read -r -d '' PAC_INSTALLED <<'SH'
+pacman -Q "$1" >/dev/null 2>&1 && printf '%s\t%s\t1\t\n' "$1" "$(pacman -Q "$1" | cut -d' ' -f2)"
+SH
+
+read -r -d '' APT_EXACT <<'SH'
+out=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null)
+inst=$(printf '%s\n' "$out" | awk '/Installed:/{print $2; exit}')
+cand=$(printf '%s\n' "$out" | awk '/Candidate:/{print $2; exit}')
+[ -n "$cand" ] && [ "$cand" != "(none)" ] || exit 0
+i=0; [ -n "$inst" ] && [ "$inst" != "(none)" ] && i=1
+printf '%s\t%s\t%s\t\n' "$1" "$cand" "$i"
+SH
+read -r -d '' APT_SEARCH <<'SH'
+LC_ALL=C apt-cache search --names-only "$1" 2>/dev/null |
+  awk -v q="$1" '{ n = $1; s = (n == q) ? 0 : (index(n, q) == 1) ? 1 : 2; print s, length(n), $0 }' |
+  sort -k1,1n -k2,2n | cut -d' ' -f3- | head -n 8 |
+  while IFS= read -r l; do
+    n=${l%% - *}; d=${l#* - }
+    v=$(LC_ALL=C apt-cache policy "$n" | awk '/Candidate:/{print $2; exit}')
+    i=0; dpkg-query -W -f='${Status}' "$n" 2>/dev/null | grep -q 'ok installed' && i=1
+    printf '%s\t%s\t%s\t%s\n' "$n" "$v" "$i" "$d"
+  done
+SH
+read -r -d '' APT_INSTALLED <<'SH'
+v=$(dpkg-query -W -f='${Status}|${Version}' "$1" 2>/dev/null) || exit 0
+case "$v" in *"ok installed|"*) printf '%s\t%s\t1\t\n' "$1" "${v##*|}" ;; esac
+SH
+
+read -r -d '' DNF_EXACT <<'SH'
+v=$(LC_ALL=C dnf -q repoquery --latest-limit=1 --qf '%{version}-%{release}\n' "$1" 2>/dev/null | sed 's/\\n$//' | grep -v '^$' | head -n1)
+[ -n "$v" ] || exit 0
+i=0; rpm -q "$1" >/dev/null 2>&1 && i=1
+printf '%s\t%s\t%s\t\n' "$1" "$v" "$i"
+SH
+read -r -d '' DNF_SEARCH <<'SH'
+LC_ALL=C dnf -q repoquery --latest-limit=1 --qf '%{name}|%{version}-%{release}|%{summary}\n' "*$1*" 2>/dev/null |
+  sed 's/\\n$//' | grep -v '^$' | sort -u -t'|' -k1,1 |
+  awk -F'|' -v q="$1" '{ s = ($1 == q) ? 0 : (index($1, q) == 1) ? 1 : 2; print s "|" length($1) "|" $0 }' |
+  sort -t'|' -k1,1n -k2,2n | cut -d'|' -f3- | head -n 8 |
+  while IFS='|' read -r n v d; do
+    i=0; rpm -q "$n" >/dev/null 2>&1 && i=1
+    printf '%s\t%s\t%s\t%s\n' "$n" "$v" "$i" "$d"
+  done
+SH
+read -r -d '' RPM_INSTALLED <<'SH'
+v=$(rpm -q --qf '%{version}-%{release}' "$1" 2>/dev/null) && printf '%s\t%s\t1\t\n' "$1" "$v"
+SH
+
+read -r -d '' ZYP_EXACT <<'SH'
+v=$(LC_ALL=C zypper -q --non-interactive info "$1" 2>/dev/null | awk -F' *: ' '$1=="Version"{print $2; exit}')
+[ -n "$v" ] || exit 0
+i=0; rpm -q "$1" >/dev/null 2>&1 && i=1
+printf '%s\t%s\t%s\t\n' "$1" "$v" "$i"
+SH
+read -r -d '' ZYP_SEARCH <<'SH'
+LC_ALL=C zypper -q --non-interactive se -s -t package "$1" 2>/dev/null |
+  awk -F'|' 'NF >= 6 && $2 !~ /Name/ { for (k = 1; k <= NF; k++) gsub(/^ +| +$/, "", $k)
+             printf "%s\t%s\t%s\t\n", $2, $4, ($1 ~ /i/) ? 1 : 0 }' | head -n 8
+SH
+
+# --- сайты Arch и AUR (когда своего pacman нет) ---
+urlenc() { printf '%s' "$1" | sed 's/+/%2B/g; s/@/%40/g'; }
+split_objects() { sed 's/},{/}\n{/g'; }
+aur_rows() {  # JSON AUR RPC → имя/версия/описание
+  split_objects | awk '{ n = v = d = ""
+    if (match($0, /"Name":"[^"]*"/))                 n = substr($0, RSTART + 8,  RLENGTH - 9)
+    if (match($0, /"Version":"[^"]*"/))              v = substr($0, RSTART + 11, RLENGTH - 12)
+    if (match($0, /"Description":"([^"\\]|\\.)*"/))  d = substr($0, RSTART + 15, RLENGTH - 16)
+    gsub(/\\"/, "\"", d); gsub(/\\\\/, "\\", d)
+    if (n != "") printf "%s\t%s\t0\t%s\n", n, v, d }'
+}
+arch_rows() {  # JSON archlinux.org → имя/версия/описание
+  split_objects | awk '{ n = v = r = d = ""; e = 0
+    if (match($0, /"pkgname":"[^"]*"/))             n = substr($0, RSTART + 11, RLENGTH - 12)
+    if (match($0, /"pkgver":"[^"]*"/))              v = substr($0, RSTART + 10, RLENGTH - 11)
+    if (match($0, /"pkgrel":"[^"]*"/))              r = substr($0, RSTART + 10, RLENGTH - 11)
+    if (match($0, /"epoch":[0-9]+/))                e = substr($0, RSTART + 8,  RLENGTH - 8)
+    if (match($0, /"pkgdesc":"([^"\\]|\\.)*"/))     d = substr($0, RSTART + 11, RLENGTH - 12)
+    gsub(/\\"/, "\"", d); gsub(/\\\\/, "\\", d)
+    if (n != "") printf "%s\t%s%s-%s\t0\t%s\n", n, (e > 0 ? e ":" : ""), v, r, d }' | awk '!seen[$1]++'
+}
+aur_query() {  # $1 = exact|search, $2 = имя
+  local u="https://aur.archlinux.org/rpc/v5"
+  if [ "$1" = exact ]; then curl -fsS --max-time 20 "$u/info?arg%5B%5D=$(urlenc "$2")"
+  else curl -fsS --max-time 20 "$u/search/$(urlenc "$2")?by=name"; fi 2>/dev/null | aur_rows
+}
+arch_web_query() {
+  local u="https://archlinux.org/packages/search/json/"
+  if [ "$1" = exact ]; then curl -fsS --max-time 20 "$u?name=$(urlenc "$2")"
+  else curl -fsS --max-time 20 "$u?q=$(urlenc "$2")"; fi 2>/dev/null | arch_rows
+}
+# Пометить установленные (pacman -Q на хосте или в контейнере)
+mark_installed() {  # $1 = host | имя контейнера; строки на stdin
+  local rows names inst
+  rows="$(cat)"; [ -n "$rows" ] || return 0
+  names="$(cut -f1 <<<"$rows" | tr '\n' ' ')"
+  if [ "$1" = host ]; then
+    # shellcheck disable=SC2086
+    inst="$(pacman -Qq $names 2>/dev/null)"
+  elif box_exists "$1"; then
+    # shellcheck disable=SC2086
+    inst="$(box_sh "$1" 'pacman -Qq "$@" 2>/dev/null' $names)"
+  fi
+  DBX_INST="${inst:-}" awk -F'\t' -v OFS='\t' 'BEGIN { n = split(ENVIRON["DBX_INST"], a, "\n"); for (k = 1; k <= n; k++) ins[a[k]] = 1 }
+    { if ($1 in ins) $3 = 1; print }' <<<"$rows"
+}
+
+# ---------- источники ----------
+S_KIND=(); S_BOX=(); S_LABEL=()
+add_src() { S_KIND+=("$1"); S_BOX+=("$2"); S_LABEL+=("$3"); }
+
+discover() {  # $1 = install|search|remove|upgrade
+  local b pm helper have_arch_box=0
+  if host_pacman_ok; then add_src host-pacman "" "Arch — хост (pacman)"; fi
+  if helper="$(host_aur_helper)"; then add_src host-aur "$helper" "AUR — хост ($helper)"; fi
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    pm="$(box_pm "$b")" || continue
+    add_src "box-$pm" "$b" "$b ($pm)"
+    [ "$pm" = pacman ] && [ "$b" = "$ARCH_BOX" ] && have_arch_box=1
+  done < <(list_boxes)
+  [ "$1" = install ] || [ "$1" = search ] || return 0
+  # в поиске AUR достаточно показать один раз
+  if [ "$1" = search ] && [ -n "${helper:-}" ]; then
+    [ "$have_arch_box" = 0 ] && ! host_pacman_ok && add_src new-arch "$ARCH_BOX" "Arch — $ARCH_BOX (создам)"
+    return 0
+  fi
+  if [ "$have_arch_box" = 1 ]; then
+    add_src box-aur "$ARCH_BOX" "AUR — $ARCH_BOX (yay)"
+  elif ! host_pacman_ok; then
+    add_src new-arch "$ARCH_BOX" "Arch — $ARCH_BOX (создам)"
+    add_src box-aur "$ARCH_BOX" "AUR — $ARCH_BOX (создам)"
+  elif [ -z "${helper:-}" ]; then
+    add_src box-aur "$ARCH_BOX" "AUR — $ARCH_BOX (создам)"
+  fi
+}
+
+query() {  # $1 = индекс источника, $2 = exact|search|installed, $3 = имя
+  local k="${S_KIND[$1]}" b="${S_BOX[$1]}" m="$2" n="$3" s=""
+  case "$k:$m" in
+    host-pacman:exact)     sh -c "$PAC_EXACT" sh "$n" ;;
+    host-pacman:search)    sh -c "$PAC_SEARCH" sh "$n" ;;
+    host-pacman:installed) sh -c "$PAC_INSTALLED" sh "$n" ;;
+    host-aur:exact|host-aur:search) aur_query "$m" "$n" | mark_installed host ;;
+    box-aur:exact|box-aur:search)   aur_query "$m" "$n" | mark_installed "$b" ;;
+    new-arch:exact|new-arch:search) arch_web_query "$m" "$n" ;;
+    box-*:*)
+      case "$k:$m" in
+        box-apt:exact) s="$APT_EXACT" ;;     box-apt:search) s="$APT_SEARCH" ;;   box-apt:installed) s="$APT_INSTALLED" ;;
+        box-dnf:exact) s="$DNF_EXACT" ;;     box-dnf:search) s="$DNF_SEARCH" ;;   box-dnf:installed) s="$RPM_INSTALLED" ;;
+        box-pacman:exact) s="$PAC_EXACT" ;;  box-pacman:search) s="$PAC_SEARCH" ;; box-pacman:installed) s="$PAC_INSTALLED" ;;
+        box-zypper:exact) s="$ZYP_EXACT" ;;  box-zypper:search) s="$ZYP_SEARCH" ;; box-zypper:installed) s="$RPM_INSTALLED" ;;
+      esac
+      [ -n "$s" ] && box_sh "$b" "$s" "$n" ;;
+  esac
+}
+
+# Отсортировать по близости к запросу и обрезать
+rank() {
+  awk -F'\t' -v q="$1" '{ n = $1; s = (n == q) ? 0 : (index(n, q) == 1) ? 1 : (index(n, q) > 0) ? 2 : 3
+                          print s "\t" length(n) "\t" $0 }' | sort -t$'\t' -k1,1n -k2,2n | cut -f3- | head -n "${2:-8}"
+}
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+run_all() {  # $1 = режим, $2 = имя; результаты в $TMP/<индекс>
+  local i names=()
+  for i in "${!S_KIND[@]}"; do names+=("${S_LABEL[$i]%% (*}"); done
+  printf '%sИщу «%s»:%s %s\n' "$D" "$2" "$R" "$(IFS=,; echo "${names[*]}" | sed 's/,/, /g')" >&2
+  [[ " ${S_KIND[*]} " == *" box-dnf "* ]] && printf '%s(первый поиск в fedora может занять до минуты — загрузка метаданных)%s\n' "$D" "$R" >&2
+  for i in "${!S_KIND[@]}"; do
+    query "$i" "$1" "$2" >"$TMP/$i" 2>/dev/null &
+  done
+  wait
+}
+
+ask() {  # $1 = вопрос; ответ в REPLY
+  printf '%s' "$1" >&2
+  read -r REPLY <"$TTY" || REPLY=q
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9@._+-]+$ ]] || die "странное имя пакета: «$1»"; }
+
+# ---------- действия ----------
+do_install_from() {  # $1 = индекс источника, $2 = имя
+  local k="${S_KIND[$1]}" b="${S_BOX[$1]}" n="$2"
+  case "$k" in
+    host-pacman) sudo pacman -S --needed "$n" ;;
+    host-aur)    "$b" -S "$n" ;;
+    box-apt)     distrobox enter -n "$b" -- sudo apt install "$n" ;;
+    box-dnf)     distrobox enter -n "$b" -- sudo dnf install "$n" ;;
+    box-pacman)  distrobox enter -n "$b" -- sudo pacman -Syu --needed "$n" ;;
+    box-zypper)  distrobox enter -n "$b" -- sudo zypper install "$n" ;;
+    new-arch)    ensure_box "$b" "$ARCH_IMAGE" && distrobox enter -n "$b" -- sudo pacman -Syu --needed "$n" ;;
+    box-aur)     ensure_box "$b" "$ARCH_IMAGE" && ensure_yay_in_box "$b" && distrobox enter -n "$b" -- yay -S "$n" ;;
+  esac
+  local rc=$?
+  case "$k" in host-*) ;; *) echo; dbx_sync "$b" ;; esac
+  return $rc
+}
+
+do_remove_from() {
+  local k="${S_KIND[$1]}" b="${S_BOX[$1]}" n="$2"
+  case "$k" in
+    host-pacman) sudo pacman -Rns "$n" ;;
+    box-apt)     distrobox enter -n "$b" -- sudo apt remove "$n" ;;
+    box-dnf)     distrobox enter -n "$b" -- sudo dnf remove "$n" ;;
+    box-pacman)  distrobox enter -n "$b" -- sudo pacman -Rns "$n" ;;
+    box-zypper)  distrobox enter -n "$b" -- sudo zypper remove "$n" ;;
+  esac
+  local rc=$?
+  case "$k" in host-*) ;; *) echo; dbx_sync "$b" ;; esac
+  return $rc
+}
+
+# Таблица вариантов и выбор. Строки: «индекс_источника<TAB>имя<TAB>версия<TAB>установлен»
+# Дополнить пробелами до ширины в символах (printf считает байты, а кириллица — 2 байта)
+pad() { local s="$1" w="$2"; printf '%s%*s' "$s" $((w - ${#s} > 0 ? w - ${#s} : 0)) ''; }
+
+choose() {  # $1 = заголовок, $2 = вопрос; варианты в $TMP/rows; выбранная строка → CHOICE
+  local rows=() line i=0 n src ver inst lw=0 nw=0 l
+  mapfile -t rows <"$TMP/rows"
+  for line in "${rows[@]}"; do
+    IFS=$'\037' read -r src n ver inst <<<"${line//$'\t'/$'\037'}"
+    l="${S_LABEL[$src]}"; [ ${#l} -gt $lw ] && lw=${#l}; [ ${#n} -gt $nw ] && nw=${#n}
+  done
+  printf '\n%s%s%s\n' "$B" "$1" "$R"
+  for line in "${rows[@]}"; do
+    i=$((i + 1)); IFS=$'\037' read -r src n ver inst <<<"${line//$'\t'/$'\037'}"
+    printf '  %s%2d)%s %s  %s  %s%s%s%s\n' "$B" "$i" "$R" "$(pad "${S_LABEL[$src]}" "$lw")" "$(pad "$n" "$nw")" \
+      "$G" "$ver" "$R" "$([ "$inst" = 1 ] && printf '  %s[установлен]%s' "$Y" "$R")"
+  done
+  echo
+  ask "$2 [1-$i, Enter = 1, q = отмена]: "
+  case "$REPLY" in
+    ''|1) CHOICE="${rows[0]}" ;;
+    q|Q|й|Й) echo "Отменено."; exit 0 ;;
+    *) [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le "$i" ] || die "нет варианта «$REPLY»"
+       CHOICE="${rows[$((REPLY - 1))]}" ;;
+  esac
+}
+
+cmd_search() {
+  local name="$1" i shown=0 n v inst d
+  valid_name "$name"; discover search; run_all search "$name"
+  for i in "${!S_KIND[@]}"; do
+    [ -s "$TMP/$i" ] || continue
+    shown=1
+    printf '\n%s── %s ──%s\n' "$C" "${S_LABEL[$i]}" "$R"
+    rank "$name" 8 <"$TMP/$i" | tr '\t' '\037' | while IFS=$'\037' read -r n v inst d; do
+      [ -n "$v" ] || v="-"
+      [ ${#d} -gt 60 ] && d="${d:0:57}..."
+      printf '  %s %s%s%s %s%s\n' "$(pad "$n" 28)" "$G" "$(pad "$v" 18)" "$R" "$([ "$inst" = 1 ] && printf '%s[уст.]%s ' "$Y" "$R")" "$D$d$R"
+    done
+  done
+  [ "$shown" = 1 ] || echo "Ничего не найдено."
+}
+
+cmd_install() {
+  local name="$1" i src
+  valid_name "$name"; discover install; run_all exact "$name"
+  : >"$TMP/rows"
+  for i in "${!S_KIND[@]}"; do
+    [ -s "$TMP/$i" ] || continue
+    awk -F'\t' -v OFS='\t' -v i="$i" -v q="$name" '$1 == q { print i, $1, $2, $3; exit }' "$TMP/$i" >>"$TMP/rows"
+  done
+  if [ ! -s "$TMP/rows" ]; then
+    echo "Пакета «$name» с точно таким именем нигде нет. Похожие:"
+    S_KIND=(); S_BOX=(); S_LABEL=()
+    cmd_search "$name"
+    return 1
+  fi
+  choose "«$name» есть здесь:" "Откуда ставить?"
+  src="${CHOICE%%$'\t'*}"
+  echo; printf '%s==> %s: ставлю %s%s\n' "$B" "${S_LABEL[$src]}" "$name" "$R"
+  do_install_from "$src" "$name"
+}
+
+cmd_remove() {
+  local name="$1" i
+  valid_name "$name"; discover remove; run_all installed "$name"
+  : >"$TMP/rows"
+  for i in "${!S_KIND[@]}"; do
+    [ -s "$TMP/$i" ] || continue
+    awk -F'\t' -v OFS='\t' -v i="$i" 'NR == 1 { print i, $1, $2, $3 }' "$TMP/$i" >>"$TMP/rows"
+  done
+  [ -s "$TMP/rows" ] || { echo "«$name» нигде не установлен."; return 1; }
+  choose "«$name» установлен здесь:" "Откуда удалить?"
+  i="${CHOICE%%$'\t'*}"
+  do_remove_from "$i" "$name"
+}
+
+cmd_upgrade() {
+  local yes=0 i k b helper rc=0
+  [ "${1:-}" = -y ] && yes=1
+  discover upgrade
+  local y_apt=() y_pac=() y_zyp=() y_fp=()
+  [ "$yes" = 1 ] && { y_apt=(-y); y_pac=(--noconfirm); y_zyp=(--non-interactive); y_fp=(-y); }
+  if helper="$(host_aur_helper)"; then
+    printf '\n%s==> Хост: %s -Syu%s\n' "$B" "$helper" "$R"; "$helper" -Syu "${y_pac[@]}" || rc=1
+  elif host_pacman_ok; then
+    printf '\n%s==> Хост: pacman -Syu%s\n' "$B" "$R"; sudo pacman -Syu "${y_pac[@]}" || rc=1
+  fi
+  if command -v flatpak >/dev/null; then
+    printf '\n%s==> Flatpak%s\n' "$B" "$R"; flatpak update "${y_fp[@]}" || rc=1
+  fi
+  for i in "${!S_KIND[@]}"; do
+    k="${S_KIND[$i]}"; b="${S_BOX[$i]}"
+    [[ "$k" == box-* ]] || continue
+    printf '\n%s==> %s%s\n' "$B" "${S_LABEL[$i]}" "$R"
+    case "$k" in
+      box-apt)    distrobox enter -n "$b" -- sh -c 'sudo apt update && sudo apt upgrade "$@"' sh "${y_apt[@]}" ;;
+      box-dnf)    distrobox enter -n "$b" -- sudo dnf upgrade "${y_apt[@]}" ;;
+      box-zypper) distrobox enter -n "$b" -- sudo zypper "${y_zyp[@]}" update ;;
+      box-pacman)
+        if distrobox enter -n "$b" -- sh -c 'command -v yay >/dev/null' </dev/null 2>/dev/null; then
+          distrobox enter -n "$b" -- yay -Syu "${y_pac[@]}"
+        else
+          distrobox enter -n "$b" -- sudo pacman -Syu "${y_pac[@]}"
+        fi ;;
+    esac || rc=1
+  done
+  echo; dbx_sync
+  return $rc
+}
+
+cmd_sources() {
+  local i
+  discover install
+  echo "Источники пакетов:"
+  for i in "${!S_KIND[@]}"; do printf '  • %s\n' "${S_LABEL[$i]}"; done
+  host_pacman_ok || { [ -x /usr/bin/pacman ] && printf '  %s(pacman хоста пропущен: система только для чтения)%s\n' "$D" "$R"; }
+  return 0
+}
+
+case "${1:-}" in
+  install|in|i)  [ $# -eq 2 ] || die "использование: dbx install ИМЯ"; cmd_install "$2" ;;
+  search|se|s)   [ $# -eq 2 ] || die "использование: dbx search ИМЯ"; cmd_search "$2" ;;
+  remove|rm|r)   [ $# -eq 2 ] || die "использование: dbx remove ИМЯ"; cmd_remove "$2" ;;
+  upgrade|up|u)  cmd_upgrade "${2:-}" ;;
+  sources)       cmd_sources ;;
+  -h|--help|help|"") usage 0 ;;
+  *) die "неизвестная команда «$1» (dbx --help)" ;;
+esac

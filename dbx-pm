@@ -3,12 +3,16 @@
 # Ставится ссылками в ~/.local/bin:
 #   apt, apt-get  → выполняются в контейнере ubuntu  (DEB_BOX)
 #   dnf           → выполняется в контейнере fedora  (RPM_BOX)
+#   pacman, yay   → в контейнере arch (ARCH_BOX) — только там, где pacman хоста
+#                   недоступен (Steam Deck, Silverblue и т.п.); yay ставится сам
 #
 # Примеры (без sudo — он добавляется внутри контейнера автоматически):
 #   apt update && apt upgrade
 #   apt install vlc
 #   apt install ./программа.deb
 #   dnf install ./программа.rpm
+#   pacman -S htop          # Steam Deck: в контейнере arch
+#   yay -S visual-studio-code-bin
 #   DBX_BOX=debian apt install htop     # в другой контейнер разово
 set -uo pipefail
 ME="$(basename "$0")"
@@ -23,35 +27,17 @@ if [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; then
   exit 127
 fi
 
-DEB_BOX=ubuntu;  DEB_IMAGE=ubuntu:24.04
-RPM_BOX=fedora;  RPM_IMAGE=fedora:latest
-CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dbx-tools/config"
-# shellcheck disable=SC1090
-[ -f "$CONF" ] && . "$CONF"
+# shellcheck source=dbx-lib
+. "$(dirname "$(readlink -f "$0")")/dbx-lib"
 
 case "$ME" in
-  apt|apt-get) BOX="${DBX_BOX:-$DEB_BOX}"; IMAGE="$DEB_IMAGE" ;;
-  dnf)         BOX="${DBX_BOX:-$RPM_BOX}"; IMAGE="$RPM_IMAGE" ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  apt|apt-get) BOX="${DBX_BOX:-$DEB_BOX}";  IMAGE="$DEB_IMAGE" ;;
+  dnf)         BOX="${DBX_BOX:-$RPM_BOX}";  IMAGE="$RPM_IMAGE" ;;
+  pacman|yay)  BOX="${DBX_BOX:-$ARCH_BOX}"; IMAGE="$ARCH_IMAGE" ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-command -v distrobox >/dev/null || { echo "$ME: нужен distrobox (Arch: sudo pacman -S distrobox podman; SteamOS 3.5+: уже встроен; иначе см. README)" >&2; exit 1; }
-
-# --- совместимость со старыми Distrobox (SteamOS и др.) ---
-if [ -n "${DBX_CONTAINER_MANAGER:-}" ]; then MGR="$DBX_CONTAINER_MANAGER"
-elif command -v podman >/dev/null; then MGR=podman
-else MGR=docker; fi
-
-box_exists() { "$MGR" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx -- "$1"; }
-
-create_box() {  # $1 = имя, $2 = образ
-  local help args=(-n "$1" -i "$2")
-  help="$(distrobox create --help 2>&1)"
-  grep -q -- '--yes' <<<"$help" && args=(--yes "${args[@]}")
-  grep -q -- '--hostname' <<<"$help" && args+=(--hostname "$1")
-  distrobox create "${args[@]}"
-}
-
+command -v distrobox >/dev/null || { echo "$ME: нужен distrobox (Arch: sudo pacman -S distrobox podman; SteamOS 3.5+: уже встроен)" >&2; exit 1; }
 
 # Контейнера нет — создать (один раз)
 if ! box_exists "$BOX"; then
@@ -60,15 +46,19 @@ if ! box_exists "$BOX"; then
     echo "  distrobox create -n $BOX -i debian:stable --hostname $BOX" >&2
     exit 1
   fi
-  echo "==> Контейнера «$BOX» нет, создаю из $IMAGE (первый раз — несколько минут)" >&2
   create_box "$BOX" "$IMAGE" || exit 1
 fi
 
 # Рабочий каталог сохраняется, поэтому относительные пути (./file.deb) внутри $HOME работают.
-distrobox enter -n "$BOX" -- sudo "$ME" "$@"
+if [ "$ME" = yay ]; then
+  ensure_yay_in_box "$BOX" || exit 1
+  distrobox enter -n "$BOX" -- yay "$@"          # yay нельзя запускать через sudo
+else
+  distrobox enter -n "$BOX" -- sudo "$ME" "$@"
+fi
 rc=$?
 
-# Обновить ярлыки в меню. Для apt есть ещё хук dpkg, но в только что созданном
-# контейнере его пока нет (его кладёт dbx-sync) — поэтому синхронизируем всегда.
-"$(command -v dbx-sync || echo "$HOME/.local/bin/dbx-sync")" "$BOX" || true
+# Обновить ярлыки в меню (хуки apt/pacman появляются в контейнере только после
+# первой синхронизации, поэтому синхронизируем всегда).
+dbx_sync "$BOX"
 exit $rc

@@ -95,13 +95,23 @@ remove_shortcut() {  # $1 = контейнер, $2 = имя.desktop
 
 # Для контейнеров на apt: хук, который после каждой операции dpkg «дёргает»
 # файл-триггер на хосте. systemd (dbx-sync.path) видит это и запускает синхронизацию.
-ensure_apt_hook() {  # $1 = контейнер
-  local hook="DPkg::Post-Invoke { \"touch '$TRIGGER' 2>/dev/null || true\"; };"
+# Хуки внутри контейнера: после каждой установки/удаления «трогают» файл-триггер
+# на хосте, и dbx-sync.path сразу обновляет меню.
+#   apt    — DPkg::Post-Invoke
+#   pacman — /etc/pacman.d/hooks (срабатывает на изменения .desktop-файлов)
+ensure_hooks() {  # $1 = контейнер
+  local apt_hook="DPkg::Post-Invoke { \"touch '$TRIGGER' 2>/dev/null || true\"; };"
+  local pac_hook
+  pac_hook="$(printf '%s\n' '[Trigger]' 'Operation = Install' 'Operation = Upgrade' 'Operation = Remove' \
+    'Type = Path' 'Target = usr/share/applications/*.desktop' '' '[Action]' \
+    'Description = Обновление меню хоста (simple-distrobox-tools)' 'When = PostTransaction' \
+    "Exec = /usr/bin/touch $TRIGGER")"
+  case "$TRIGGER" in *" "*) pac_hook="" ;; esac   # pacman не любит пробелы в Exec
   "$MGR" exec -u root "$1" sh -c '
-    command -v apt-get >/dev/null 2>&1 || exit 0
-    f=/etc/apt/apt.conf.d/99dbx-sync
-    [ -f "$f" ] && [ "$(cat "$f")" = "$1" ] && exit 0
-    printf "%s\n" "$1" > "$f"' sh "$hook" >/dev/null 2>&1 || true
+    put() { [ -f "$1" ] && [ "$(cat "$1")" = "$2" ] && return; mkdir -p "$(dirname "$1")"; printf "%s\n" "$2" > "$1"; }
+    command -v apt-get >/dev/null 2>&1 && put /etc/apt/apt.conf.d/99dbx-sync "$1"
+    command -v pacman  >/dev/null 2>&1 && [ -n "$2" ] && put /etc/pacman.d/hooks/99-dbx-sync.hook "$2"
+    exit 0' sh "$apt_hook" "$pac_hook" >/dev/null 2>&1 || true
 }
 
 CHANGED=0
@@ -121,7 +131,7 @@ sync_box() {  # $1 = контейнер
     return
   fi
   log "• $c"
-  [ "$DRY" = 1 ] || ensure_apt_hook "$c"
+  [ "$DRY" = 1 ] || ensure_hooks "$c"
 
   if [ -f "$state" ]; then
     while IFS= read -r base; do [ -n "$base" ] && old["$base"]=1; done < "$state"
@@ -187,7 +197,7 @@ for state in "$STATE_DIR"/*.list; do
   printf '%s\n' "${EXISTING[@]}" | grep -qx -- "$c" && continue
   log "• $c (контейнер удалён)"
   while IFS= read -r base; do [ -n "$base" ] && remove_shortcut "$c" "$base"; done < "$state"
-  run rm -f "$state"; CHANGED=1
+  run rm -f "$state" "$STATE_DIR/pm.$c"; CHANGED=1
 done
 
 # Обновить меню
