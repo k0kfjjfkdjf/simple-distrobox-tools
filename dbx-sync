@@ -106,6 +106,12 @@ ensure_apt_hook() {  # $1 = контейнер
 
 CHANGED=0
 
+# Имя программы из строки Exec= (для старых версий distrobox-export)
+exec_name() {  # $1 = контейнер, $2 = путь к .desktop внутри контейнера
+  "$MGR" exec "$1" sh -c 'sed -n "s/^Exec=//p" "$1" | head -n1' sh "$2" 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i !~ /=/ && $i != "env") { n = split($i, p, "/"); print p[n]; exit } }'
+}
+
 sync_box() {  # $1 = контейнер
   local c="$1" state="$STATE_DIR/$1.list" found f base key
   local -A now=() old=()
@@ -130,7 +136,9 @@ sync_box() {  # $1 = контейнер
     if [ ! -f "$APPS_DIR/$c-$base" ]; then
       log "  + $base"
       if [ "$DRY" = 1 ]; then log "  [dry-run] distrobox-export --app $f"
-      elif ! out="$(distrobox enter -n "$c" -- distrobox-export --app "$f" </dev/null 2>&1)"; then
+      elif ! out="$(distrobox enter -n "$c" -- distrobox-export --app "$f" </dev/null 2>&1)" &&
+           # старые distrobox-export не принимают путь — пробуем по имени программы
+           ! out="$(distrobox enter -n "$c" -- distrobox-export --app "$(exec_name "$c" "$f")" </dev/null 2>&1)"; then
         err "! $c: не удалось экспортировать $base: ${out//$'\n'/ | }"
         unset 'now[$base]'; continue
       fi
@@ -185,6 +193,7 @@ done
 # Обновить меню
 if [ "$CHANGED" = 1 ] && [ "$DRY" = 0 ]; then
   command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" 2>/dev/null
-  command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1
+  if command -v kbuildsycoca6 >/dev/null; then kbuildsycoca6 >/dev/null 2>&1
+  elif command -v kbuildsycoca5 >/dev/null; then kbuildsycoca5 >/dev/null 2>&1; fi
 fi
 exit 0

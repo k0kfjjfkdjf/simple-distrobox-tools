@@ -46,7 +46,23 @@ shift $((OPTIND - 1))
 if [ -n "${CONTAINER_ID:-}" ] || [ -e /run/.containerenv ]; then
   die "вы сейчас ВНУТРИ контейнера «${CONTAINER_ID:-?}». Выйдите командой exit и запустите снова на хосте."
 fi
-command -v distrobox >/dev/null || die "distrobox не установлен: sudo pacman -S distrobox podman"
+command -v distrobox >/dev/null || die "distrobox не установлен (Arch: sudo pacman -S distrobox podman; SteamOS 3.5+: уже встроен; иначе см. README)"
+
+# --- совместимость со старыми Distrobox (SteamOS и др.) ---
+if [ -n "${DBX_CONTAINER_MANAGER:-}" ]; then MGR="$DBX_CONTAINER_MANAGER"
+elif command -v podman >/dev/null; then MGR=podman
+else MGR=docker; fi
+
+box_exists() { "$MGR" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx -- "$1"; }
+
+create_box() {  # $1 = имя, $2 = образ
+  local help args=(-n "$1" -i "$2")
+  help="$(distrobox create --help 2>&1)"
+  grep -q -- '--yes' <<<"$help" && args=(--yes "${args[@]}")
+  grep -q -- '--hostname' <<<"$help" && args+=(--hostname "$1")
+  distrobox create "${args[@]}"
+}
+
 
 # Что ставим: .deb-файлы, .rpm-файлы или имена пакетов
 KIND=name; ARGS=()
@@ -79,10 +95,10 @@ case "$KIND" in
 esac
 
 # Создать контейнер, если его ещё нет
-if ! distrobox list --no-color 2>/dev/null | awk -F'|' 'NR>1 {gsub(/^ +| +$/, "", $2); print $2}' | grep -qx -- "$BOX"; then
+if ! box_exists "$BOX"; then
   [ "$REMOVE" = 1 ] && die "контейнера «$BOX» нет — удалять нечего"
   echo "==> Создаю контейнер «$BOX» из образа $IMAGE (первый раз это займёт несколько минут)"
-  distrobox create --yes -n "$BOX" -i "$IMAGE" --hostname "$BOX"
+  create_box "$BOX" "$IMAGE"
 fi
 
 # Какой пакетный менеджер внутри
